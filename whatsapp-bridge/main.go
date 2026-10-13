@@ -591,7 +591,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
+	// Generate a local path for the file. Prefix the message ID because the
+	// stored filename comes from the time the message was received, so all
+	// media from the same history sync share it
+	filename = messageID + "_" + filename
 	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
 
 	// Get absolute path
@@ -667,10 +670,9 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
+	// Keep the query string: it carries the URL signature (oh, oe) and
+	// whatsmeow appends "&hash=..." to the direct path when downloading
 	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
 
 	// Create proper direct path format
 	return "/" + pathPart
