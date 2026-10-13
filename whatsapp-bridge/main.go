@@ -19,6 +19,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	"rsc.io/qr"
 
 	"bytes"
 
@@ -641,7 +642,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -800,14 +801,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -871,7 +872,15 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+
+				// Also save the QR code as an image, for when the terminal isn't visible
+				if code, err := qr.Encode(evt.Code, qr.L); err == nil {
+					if err := os.WriteFile("store/qr.png", code.PNG(), 0644); err == nil {
+						fmt.Println("QR code also saved to store/qr.png")
+					}
+				}
 			} else if evt.Event == "success" {
+				os.Remove("store/qr.png")
 				connected <- true
 				break
 			}
@@ -905,6 +914,8 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	fixUnnamedChats(client, messageStore, logger)
+
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
 
@@ -927,7 +938,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	// A name equal to the JID user is just a fallback, so keep trying to resolve it
+	if err == nil && existingName != "" && existingName != jid.User {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -973,7 +985,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,10 +999,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		if contactName := lookupContactName(client, jid); contactName != "" {
+			name = contactName
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
@@ -1003,6 +1013,76 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	}
 
 	return name
+}
+
+// lookupContactName finds the best known name for a contact. Chats addressed by LID
+// (@lid) are resolved to their phone number first, since that's where the address
+// book name usually is.
+func lookupContactName(client *whatsmeow.Client, jid types.JID) string {
+	ctx := context.Background()
+	candidates := []types.JID{jid}
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			candidates = []types.JID{pn, jid}
+		}
+	}
+
+	var contacts []types.ContactInfo
+	for _, candidate := range candidates {
+		if contact, err := client.Store.Contacts.GetContact(ctx, candidate); err == nil && contact.Found {
+			contacts = append(contacts, contact)
+		}
+	}
+
+	// Prefer the address book name over the name the contact chose for themselves
+	fields := []func(types.ContactInfo) string{
+		func(c types.ContactInfo) string { return c.FullName },
+		func(c types.ContactInfo) string { return c.FirstName },
+		func(c types.ContactInfo) string { return c.BusinessName },
+		func(c types.ContactInfo) string { return c.PushName },
+	}
+	for _, field := range fields {
+		for _, contact := range contacts {
+			if name := field(contact); name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// fixUnnamedChats retries name resolution for direct chats that were stored with
+// just their number as name (e.g. before contacts were synced)
+func fixUnnamedChats(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	rows, err := messageStore.db.Query(
+		"SELECT jid FROM chats WHERE jid NOT LIKE '%@g.us' AND (name IS NULL OR name = '' OR name = substr(jid, 1, instr(jid, '@') - 1))",
+	)
+	if err != nil {
+		logger.Warnf("Failed to query unnamed chats: %v", err)
+		return
+	}
+	var chatJIDs []string
+	for rows.Next() {
+		var chatJID string
+		if err := rows.Scan(&chatJID); err == nil {
+			chatJIDs = append(chatJIDs, chatJID)
+		}
+	}
+	rows.Close()
+
+	fixed := 0
+	for _, chatJID := range chatJIDs {
+		jid, err := types.ParseJID(chatJID)
+		if err != nil {
+			continue
+		}
+		if name := lookupContactName(client, jid); name != "" {
+			if _, err := messageStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, chatJID); err == nil {
+				fixed++
+			}
+		}
+	}
+	logger.Infof("Resolved names for %d of %d unnamed chats", fixed, len(chatJIDs))
 }
 
 // Handle history sync events
